@@ -9,3 +9,5 @@ DB_PATH = os.getenv("DB_PATH", "songs.db")
 RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "3"))
 
 WEBAPP_URL = os.getenv("WEBAPP_URL", "YOUR_WEBAPP_URL_HERE")
+
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
