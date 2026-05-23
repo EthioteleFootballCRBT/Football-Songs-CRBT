@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 import db
-from config import BOT_TOKEN, ADMIN_IDS, RATE_LIMIT_SECONDS, WEBAPP_URL
+from config import BOT_TOKEN, ADMIN_IDS, RATE_LIMIT_SECONDS, WEBAPP_URL, CHANNEL_ID
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -45,7 +45,8 @@ _last_seen: dict = {}
     ADD_TEAM, ADD_TITLE, ADD_CODE, ADD_SMS,
     ADD_FILE, ADD_CAT, ADD_LEAGUE,
     REMOVE_ID,
-) = range(8)
+    POST_LEAGUE, POST_SONGS, POST_CAPTION,
+) = range(11)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -158,6 +159,20 @@ def song_detail_text(song: dict) -> str:
 @rate_limit
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    # Handle deep link from channel post e.g. /start RMA100
+    if ctx.args:
+        code = ctx.args[0].strip().upper()
+        all_songs = db.get_all_songs()
+        song = next((s for s in all_songs if s["crbt_code"] == code), None)
+        if song:
+            await update.message.reply_text(
+                song_detail_text(song),
+                parse_mode="HTML",
+                reply_markup=build_song_detail_menu(song["id"], song["league"], song["team_name"]),
+            )
+            return
+
     text = (
         f"🇪🇹⚽ <b>Welcome to EthioFootball CRBT Bot</b>, {user.first_name}!\n\n"
         "Discover your favourite football team's CRBT songs and activate them "
@@ -527,6 +542,263 @@ async def unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+# ── /post — Channel Post Builder ─────────────────────────────────────────────
+
+@admin_only
+async def post_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not CHANNEL_ID:
+        await update.message.reply_text(
+            "❌ CHANNEL_ID not set in environment variables.\n"
+            "Add your channel username (e.g. @telefootballsongbot) to Render environment."
+        )
+        return ConversationHandler.END
+
+    leagues = db.get_leagues()
+    buttons = [[InlineKeyboardButton(
+        f"{LEAGUE_EMOJI.get(lg, '⚽')} {lg}", callback_data=f"postleague:{lg}"
+    )] for lg in leagues]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="postcancel")])
+
+    await update.message.reply_text(
+        "📢 <b>Create Channel Post</b>\n\n"
+        "Step 1: Select a league to post songs from:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return POST_LEAGUE
+
+
+async def post_league_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "postcancel":
+        await query.edit_message_text("❌ Post cancelled.")
+        return ConversationHandler.END
+
+    league = query.data.replace("postleague:", "")
+    ctx.user_data["post_league"] = league
+    ctx.user_data["post_songs"] = []
+
+    songs = db.get_songs_by_league(league) if hasattr(db, 'get_songs_by_league') else []
+    # fallback: get all songs for league
+    if not songs:
+        all_songs = db.get_all_songs()
+        songs = [s for s in all_songs if s["league"] == league]
+
+    ctx.user_data["available_songs"] = songs
+
+    buttons = []
+    for s in songs:
+        buttons.append([InlineKeyboardButton(
+            f"⚽ {s['team_name']} — 🎵 {s['song_title']}",
+            callback_data=f"picksong:{s['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("✅ Done — Preview Post", callback_data="postdone")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="postcancel")])
+
+    await query.edit_message_text(
+        f"📢 <b>{league}</b>\n\n"
+        f"Step 2: Select songs to include in the post\n"
+        f"(tap each song you want to add):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return POST_SONGS
+
+
+async def post_song_picked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "postcancel":
+        await query.edit_message_text("❌ Post cancelled.")
+        return ConversationHandler.END
+
+    if query.data == "postdone":
+        selected = ctx.user_data.get("post_songs", [])
+        if not selected:
+            await query.answer("⚠️ Pick at least one song first!", show_alert=True)
+            return POST_SONGS
+
+        # Ask for optional custom caption
+        await query.edit_message_text(
+            "📝 <b>Step 3: Add a custom message</b> (optional)\n\n"
+            "Type a message to add at the top of the post\n"
+            "or send <code>skip</code> to use the default.",
+            parse_mode="HTML"
+        )
+        return POST_CAPTION
+
+    song_id = int(query.data.replace("picksong:", ""))
+    selected = ctx.user_data.get("post_songs", [])
+
+    if song_id in selected:
+        selected.remove(song_id)
+        await query.answer("❌ Removed from post")
+    else:
+        selected.append(song_id)
+        await query.answer("✅ Added to post!")
+
+    ctx.user_data["post_songs"] = selected
+
+    # Update buttons to show selected status
+    songs = ctx.user_data.get("available_songs", [])
+    league = ctx.user_data.get("post_league", "")
+    buttons = []
+    for s in songs:
+        is_selected = s["id"] in selected
+        label = f"{'✅' if is_selected else '⚽'} {s['team_name']} — {s['song_title']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"picksong:{s['id']}")])
+    buttons.append([InlineKeyboardButton(
+        f"✅ Done — Preview Post ({len(selected)} selected)",
+        callback_data="postdone"
+    )])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="postcancel")])
+
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
+    return POST_SONGS
+
+
+async def post_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    caption_text = update.message.text.strip()
+    if caption_text.lower() == "skip":
+        caption_text = ""
+    ctx.user_data["post_caption"] = caption_text
+
+    selected_ids = ctx.user_data.get("post_songs", [])
+    songs = [db.get_song_by_id(sid) for sid in selected_ids]
+    songs = [s for s in songs if s]
+
+    # Build preview
+    preview = _build_post_text(songs, caption_text)
+
+    buttons = _build_post_buttons(songs)
+
+    await update.message.reply_text(
+        f"👀 <b>Preview your channel post:</b>\n\n{preview}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Send to Channel", callback_data="postsend")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="postcancel")],
+        ])
+    )
+
+    # Store preview data
+    ctx.user_data["preview_text"]    = preview
+    ctx.user_data["preview_buttons"] = buttons
+    ctx.user_data["preview_songs"]   = songs
+
+    return POST_CAPTION
+
+
+async def post_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "postcancel":
+        await query.edit_message_text("❌ Post cancelled.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    songs   = ctx.user_data.get("preview_songs", [])
+    text    = ctx.user_data.get("preview_text", "")
+    buttons = ctx.user_data.get("preview_buttons", [])
+
+    try:
+        await ctx.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        await query.edit_message_text(
+            f"✅ <b>Posted to {CHANNEL_ID}!</b>\n\n"
+            f"{len(songs)} song(s) posted successfully.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ Failed to post: {e}\n\n"
+            f"Make sure the bot is an admin in {CHANNEL_ID}"
+        )
+
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
+def _build_post_text(songs: list, custom_caption: str = "") -> str:
+    lines = []
+
+    if custom_caption:
+        lines.append(f"📢 {custom_caption}\n")
+
+    lines.append("🇪🇹⚽ <b>EthioFootball CRBT Songs</b>")
+    lines.append("Activate your favourite football ringtone on Ethio Telecom!\n")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    for s in songs:
+        lines.append(
+            f"\n⚽ <b>{s['team_name']}</b>\n"
+            f"🎵 {s['song_title']}\n"
+            f"🏷 Code: <code>{s['crbt_code']}</code>\n"
+            f"📱 Send <code>{s['sms_command']}</code> to <b>822</b>"
+        )
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+    lines.append("\n🔵 <b>First time?</b> Send <code>A</code> to <b>822</b> first")
+    lines.append("📲 Tap a button below to preview and activate instantly!")
+
+    return "\n".join(lines)
+
+
+def _build_post_buttons(songs: list) -> list:
+    buttons = []
+    for s in songs:
+        row = []
+        # Bot button
+        bot_url = f"https://t.me/telefootballsongbot?start={s['crbt_code']}"
+        row.append(InlineKeyboardButton(
+            f"🤖 {s['team_name']}",
+            url=bot_url
+        ))
+        # Webapp button
+        if WEBAPP_URL and WEBAPP_URL not in ("YOUR_WEBAPP_URL_HERE", ""):
+            from urllib.parse import urlencode
+            params = urlencode({
+                "team":  s["team_name"],
+                "title": s["song_title"],
+                "code":  s["crbt_code"],
+                "sms":   s["sms_command"],
+            })
+            row.append(InlineKeyboardButton(
+                "📲 Activate",
+                url=f"{WEBAPP_URL}?{params}"
+            ))
+        buttons.append(row)
+
+    return buttons
+
+
+async def post_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ Post cancelled.")
+    return ConversationHandler.END
+
+
+async def post_callback_in_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle postsend and postcancel callbacks inside conversation."""
+    query = update.callback_query
+    if query.data == "postsend":
+        return await post_send(update, ctx)
+    elif query.data == "postcancel":
+        await query.answer()
+        await query.edit_message_text("❌ Post cancelled.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    return POST_CAPTION
+
+
 async def run_bot():
     db.init_db()
     logger.info("Database initialised.")
@@ -555,12 +827,27 @@ async def run_bot():
         fallbacks=[CommandHandler("cancel", addsong_cancel)],
     )
 
+    # /post conversation
+    post_conv = ConversationHandler(
+        entry_points=[CommandHandler("post", post_start)],
+        states={
+            POST_LEAGUE: [CallbackQueryHandler(post_league_chosen)],
+            POST_SONGS:  [CallbackQueryHandler(post_song_picked)],
+            POST_CAPTION:[
+                MessageHandler(filters.TEXT & ~filters.COMMAND, post_caption),
+                CallbackQueryHandler(post_callback_in_conv),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", post_cancel)],
+    )
+
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("search",    cmd_search))
     app.add_handler(CommandHandler("listsongs", cmd_listsongs))
     app.add_handler(addsong_conv)
     app.add_handler(removesong_conv)
+    app.add_handler(post_conv)
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
